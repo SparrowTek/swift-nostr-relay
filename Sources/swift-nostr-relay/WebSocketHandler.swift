@@ -3,6 +3,7 @@ import HummingbirdWebSocket
 import CoreNostr
 import Logging
 import NIOCore
+import Atomics
 
 /// Handles WebSocket connections for Nostr relay protocol with database support and rate limiting
 final class WebSocketHandler: Sendable {
@@ -15,9 +16,12 @@ final class WebSocketHandler: Sendable {
     let rateLimiter: RateLimiter
     let spamFilter: SpamFilter
     let subscriptionManager: SubscriptionManager
+    let authManager: AuthManager
+    let securityPolicy: SecurityPolicy
     let clientIP: String
     
     private let validator: EventValidator
+    private let needsAuth: ManagedAtomic<Bool>
     
     init(
         inbound: WebSocketInboundStream,
@@ -27,6 +31,8 @@ final class WebSocketHandler: Sendable {
         rateLimiter: RateLimiter,
         spamFilter: SpamFilter,
         subscriptionManager: SubscriptionManager,
+        authManager: AuthManager,
+        securityPolicy: SecurityPolicy,
         clientIP: String,
         logger: Logger
     ) {
@@ -37,9 +43,12 @@ final class WebSocketHandler: Sendable {
         self.rateLimiter = rateLimiter
         self.spamFilter = spamFilter
         self.subscriptionManager = subscriptionManager
+        self.authManager = authManager
+        self.securityPolicy = securityPolicy
         self.clientIP = clientIP
         self.logger = logger
         self.validator = EventValidator(configuration: configuration, logger: logger)
+        self.needsAuth = ManagedAtomic<Bool>(configuration.authRequired)
     }
     
     func handle() async throws {
@@ -55,14 +64,28 @@ final class WebSocketHandler: Sendable {
         await subscriptionManager.registerConnection(id: connectionId, clientIP: clientIP, handler: self)
         
         defer {
-            Task { [clientIP, connectionId, rateLimiter, subscriptionManager] in
+            Task { [clientIP, connectionId, rateLimiter, subscriptionManager, authManager] in
                 await rateLimiter.unregisterConnection(from: clientIP)
                 await subscriptionManager.unregisterConnection(id: connectionId)
+                await authManager.revokeAuthentication(connectionId)
             }
+        }
+        
+        // Send AUTH challenge if authentication is required
+        if configuration.authRequired {
+            await sendAuthChallenge()
         }
         
         do {
             for try await frame in inbound {
+                // Check if connection is banned
+                if await securityPolicy.isBanned(connectionId) {
+                    logger.warning("Banned connection attempted to send message", metadata: [
+                        "connectionId": "\(connectionId)"
+                    ])
+                    try await outbound.close(.policyViolation, reason: "Banned")
+                    break
+                }
                 switch frame.opcode {
                 case .text:
                     let text = String(buffer: frame.data)
@@ -91,6 +114,26 @@ final class WebSocketHandler: Sendable {
     private func handleTextMessage(_ text: String) async {
         guard let data = text.data(using: .utf8) else {
             await sendNotice("Invalid UTF-8")
+            let action = await securityPolicy.reportViolation(
+                connectionId: connectionId,
+                clientIP: clientIP,
+                type: .malformedJSON,
+                details: "Invalid UTF-8 encoding"
+            )
+            await handleSecurityAction(action)
+            return
+        }
+        
+        // Check message size
+        if !securityPolicy.validateMessageSize(data.count) {
+            await sendNotice("Message too large")
+            let action = await securityPolicy.reportViolation(
+                connectionId: connectionId,
+                clientIP: clientIP,
+                type: .oversizedMessage,
+                details: "Message size: \(data.count) bytes"
+            )
+            await handleSecurityAction(action)
             return
         }
         
@@ -98,11 +141,25 @@ final class WebSocketHandler: Sendable {
             let json = try JSONSerialization.jsonObject(with: data)
             guard let array = json as? [Any], !array.isEmpty else {
                 await sendNotice("Invalid message format: expected JSON array")
+                let action = await securityPolicy.reportViolation(
+                    connectionId: connectionId,
+                    clientIP: clientIP,
+                    type: .malformedJSON,
+                    details: "Not a JSON array"
+                )
+                await handleSecurityAction(action)
                 return
             }
             
             guard let messageType = array[0] as? String else {
                 await sendNotice("Invalid message type: first element must be a string")
+                let action = await securityPolicy.reportViolation(
+                    connectionId: connectionId,
+                    clientIP: clientIP,
+                    type: .protocolViolation,
+                    details: "Message type not a string"
+                )
+                await handleSecurityAction(action)
                 return
             }
             
@@ -117,12 +174,26 @@ final class WebSocketHandler: Sendable {
                 await handleAuth(array)
             default:
                 await sendNotice("Unknown message type: \(messageType)")
+                let action = await securityPolicy.reportViolation(
+                    connectionId: connectionId,
+                    clientIP: clientIP,
+                    type: .protocolViolation,
+                    details: "Unknown message type: \(messageType)"
+                )
+                await handleSecurityAction(action)
             }
         } catch {
             logger.error("Failed to parse message", metadata: [
                 "error": "\(error)"
             ])
             await sendNotice("Invalid JSON: \(error.localizedDescription)")
+            let action = await securityPolicy.reportViolation(
+                connectionId: connectionId,
+                clientIP: clientIP,
+                type: .malformedJSON,
+                details: "JSON parse error: \(error.localizedDescription)"
+            )
+            await handleSecurityAction(action)
         }
     }
     
@@ -130,6 +201,22 @@ final class WebSocketHandler: Sendable {
         guard array.count >= 2 else {
             await sendNotice("EVENT requires event data")
             return
+        }
+        
+        // Check authentication if required for writes
+        if needsAuth.load(ordering: .acquiring) {
+            let isAuthenticated = await authManager.isAuthenticated(connectionId)
+            if !isAuthenticated {
+                await sendNotice("auth-required: EVENT requires authentication")
+                let action = await securityPolicy.reportViolation(
+                    connectionId: connectionId,
+                    clientIP: clientIP,
+                    type: .unauthorizedAction,
+                    details: "EVENT without authentication"
+                )
+                await handleSecurityAction(action)
+                return
+            }
         }
         
         let eventJSON = array[1]
@@ -294,6 +381,22 @@ final class WebSocketHandler: Sendable {
             return
         }
         
+        // Check authentication if required for reads
+        if configuration.authConfig?.requireAuth == true {
+            let isAuthenticated = await authManager.isAuthenticated(connectionId)
+            if !isAuthenticated {
+                await sendNotice("auth-required: REQ requires authentication")
+                let action = await securityPolicy.reportViolation(
+                    connectionId: connectionId,
+                    clientIP: clientIP,
+                    type: .unauthorizedAction,
+                    details: "REQ without authentication"
+                )
+                await handleSecurityAction(action)
+                return
+            }
+        }
+        
         // Check subscription rate limit
         let canSubscribe = await rateLimiter.checkSubscriptionLimit(ip: clientIP)
         if !canSubscribe {
@@ -383,8 +486,82 @@ final class WebSocketHandler: Sendable {
     }
     
     private func handleAuth(_ array: [Any]) async {
-        // TODO: Implement NIP-42 authentication
-        await sendNotice("AUTH not yet implemented")
+        guard array.count >= 2 else {
+            await sendNotice("AUTH requires an event")
+            return
+        }
+        
+        // Parse the auth event
+        let eventJSON = array[1]
+        
+        guard let eventDict = eventJSON as? [String: Any] else {
+            await sendNotice("AUTH event must be a JSON object")
+            let _ = await securityPolicy.reportViolation(
+                connectionId: connectionId,
+                clientIP: clientIP,
+                type: .authenticationFailure,
+                details: "Invalid AUTH event format"
+            )
+            return
+        }
+        
+        // Decode into NostrEvent
+        let event: NostrEvent
+        do {
+            let jsonData = try JSONSerialization.data(withJSONObject: eventDict)
+            event = try JSONDecoder().decode(NostrEvent.self, from: jsonData)
+        } catch {
+            await sendNotice("Invalid AUTH event: \(error.localizedDescription)")
+            let _ = await securityPolicy.reportViolation(
+                connectionId: connectionId,
+                clientIP: clientIP,
+                type: .authenticationFailure,
+                details: "Failed to decode AUTH event"
+            )
+            return
+        }
+        
+        // Verify authentication
+        let result = await authManager.verifyAuthentication(connectionId: connectionId, event: event)
+        
+        switch result {
+        case .success(let pubkey, let permissions):
+            needsAuth.store(false, ordering: .releasing)
+            await securityPolicy.clearViolations(for: connectionId)
+            await sendOK(eventId: event.id, success: true, message: "Authentication successful")
+            logger.info("Client authenticated", metadata: [
+                "connectionId": "\(connectionId)",
+                "pubkey": "\(pubkey)",
+                "permissions": "\(permissions.map { $0.rawValue }.joined(separator: ","))"
+            ])
+            
+        case .failure(let reason):
+            await sendOK(eventId: event.id, success: false, message: "auth-failed: \(reason)")
+            let action = await securityPolicy.reportViolation(
+                connectionId: connectionId,
+                clientIP: clientIP,
+                type: .authenticationFailure,
+                details: reason,
+                severity: .medium
+            )
+            await handleSecurityAction(action)
+            
+        case .challengeExpired:
+            await sendOK(eventId: event.id, success: false, message: "auth-failed: challenge expired")
+            // Send new challenge
+            await sendAuthChallenge()
+            
+        case .invalidSignature:
+            await sendOK(eventId: event.id, success: false, message: "auth-failed: invalid signature")
+            let action = await securityPolicy.reportViolation(
+                connectionId: connectionId,
+                clientIP: clientIP,
+                type: .authenticationFailure,
+                details: "Invalid signature",
+                severity: .high
+            )
+            await handleSecurityAction(action)
+        }
     }
     
     private func sendHistoricalEvents(subscriptionId: String, filters: [Filter]) async {
@@ -458,6 +635,47 @@ final class WebSocketHandler: Sendable {
     }
     
     // MARK: - Helper Methods
+    
+    private func sendAuthChallenge() async {
+        let challenge = await authManager.generateChallenge(for: connectionId)
+        let authMessage = ["AUTH", challenge]
+        await sendJSON(authMessage)
+        
+        logger.info("Sent AUTH challenge", metadata: [
+            "connectionId": "\(connectionId)",
+            "challenge": "\(challenge.prefix(16))..."
+        ])
+    }
+    
+    private func handleSecurityAction(_ action: SecurityPolicy.PolicyAction) async {
+        switch action {
+        case .allow:
+            // No action needed
+            break
+            
+        case .warn:
+            await sendNotice("rate-limited: slow down")
+            
+        case .throttle(let duration):
+            logger.info("Throttling connection", metadata: [
+                "connectionId": "\(connectionId)",
+                "duration": "\(duration)"
+            ])
+            await sendNotice("rate-limited: throttled for \(Int(duration)) seconds")
+            
+        case .disconnect:
+            logger.warning("Disconnecting connection", metadata: [
+                "connectionId": "\(connectionId)"
+            ])
+            try? await outbound.close(.policyViolation, reason: "Policy violation")
+            
+        case .ban:
+            logger.error("Banning connection", metadata: [
+                "connectionId": "\(connectionId)"
+            ])
+            try? await outbound.close(.policyViolation, reason: "Banned")
+        }
+    }
     
     private func extractEventId(from eventJSON: Any) -> String? {
         guard let dict = eventJSON as? [String: Any],
