@@ -8,6 +8,11 @@ import NIOCore
 func buildApplication(logger: Logger) async throws -> some ApplicationProtocol {
     let configuration = RelayConfiguration()
     
+    // Initialize database
+    let dbConfig = DatabaseConfiguration.fromEnvironment()
+    let databaseManager = try await DatabaseManager(configuration: dbConfig, logger: logger)
+    let eventRepository = EventRepository(databaseManager: databaseManager, logger: logger)
+    
     // Create WebSocket router
     let wsRouter = Router(context: BasicWebSocketRequestContext.self)
     
@@ -51,6 +56,7 @@ func buildApplication(logger: Logger) async throws -> some ApplicationProtocol {
             inbound: inbound,
             outbound: outbound,
             configuration: configuration,
+            eventRepository: eventRepository,
             logger: logger
         )
         try await handler.handle()

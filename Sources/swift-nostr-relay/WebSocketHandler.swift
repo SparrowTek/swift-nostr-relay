@@ -4,30 +4,47 @@ import CoreNostr
 import Logging
 import NIOCore
 
-/// Handles WebSocket connections for Nostr relay protocol
+/// Handles WebSocket connections for Nostr relay protocol with database support
 actor WebSocketHandler {
     let inbound: WebSocketInboundStream
     let outbound: WebSocketOutboundWriter
     let configuration: RelayConfiguration
     let logger: Logger
     let connectionId = UUID()
+    let eventRepository: EventRepository
     
     private let validator: EventValidator
     private var subscriptions: [String: [Filter]] = [:]
     
-    // In-memory event storage (temporary until database is implemented)
-    private static var eventStore: [String: NostrEvent] = [:]
+    // Track active connections for live broadcasting
+    static var activeHandlers: [WebSocketHandler] = []
     
-    init(inbound: WebSocketInboundStream, outbound: WebSocketOutboundWriter, configuration: RelayConfiguration, logger: Logger) {
+    init(
+        inbound: WebSocketInboundStream,
+        outbound: WebSocketOutboundWriter,
+        configuration: RelayConfiguration,
+        eventRepository: EventRepository,
+        logger: Logger
+    ) {
         self.inbound = inbound
         self.outbound = outbound
         self.configuration = configuration
+        self.eventRepository = eventRepository
         self.logger = logger
         self.validator = EventValidator(configuration: configuration, logger: logger)
     }
     
     func handle() async throws {
         logger.info("New WebSocket connection: \(connectionId)")
+        
+        // Add to active handlers
+        await Self.addHandler(self)
+        
+        defer {
+            Task {
+                await Self.removeHandler(self)
+            }
+        }
         
         do {
             for try await frame in inbound {
@@ -48,6 +65,20 @@ actor WebSocketHandler {
         }
         
         logger.info("WebSocket connection closed: \(connectionId)")
+    }
+    
+    private static func addHandler(_ handler: WebSocketHandler) async {
+        activeHandlers.append(handler)
+    }
+    
+    private static func removeHandler(_ handler: WebSocketHandler) async {
+        activeHandlers.removeAll { $0.connectionId == handler.connectionId }
+    }
+    
+    static func broadcastEvent(_ event: NostrEvent) async {
+        for handler in activeHandlers {
+            await handler.broadcastToSubscribers(event: event)
+        }
     }
     
     private func handleTextMessage(_ text: String) async {
@@ -99,32 +130,32 @@ actor WebSocketHandler {
         
         switch result {
         case .valid(let event):
-            // Store event (temporary in-memory storage)
+            // Don't store ephemeral events
             if !EventValidator.isEphemeral(kind: event.kind) {
-                // Handle replaceable events
-                if let replacementKey = EventValidator.getReplacementKey(event: event) {
-                    // Remove old replaceable event if exists
-                    let oldEvents = Self.eventStore.values.filter { oldEvent in
-                        EventValidator.getReplacementKey(event: oldEvent) == replacementKey
+                do {
+                    let stored = try await eventRepository.storeEvent(event)
+                    
+                    if stored {
+                        logger.info("Stored event \(event.id) from \(event.pubkey)")
+                        
+                        // Broadcast to all connected clients
+                        await Self.broadcastEvent(event)
+                        await sendOK(eventId: event.id, success: true, message: nil)
+                    } else {
+                        // Event already exists
+                        logger.debug("Duplicate event: \(event.id)")
+                        await sendOK(eventId: event.id, success: false, message: "duplicate: event already exists")
                     }
-                    for oldEvent in oldEvents {
-                        Self.eventStore.removeValue(forKey: oldEvent.id)
-                        logger.debug("Replaced event \(oldEvent.id) with \(event.id)")
-                    }
+                } catch {
+                    logger.error("Failed to store event: \(error)")
+                    await sendOK(eventId: event.id, success: false, message: "error: failed to store event")
                 }
-                
-                Self.eventStore[event.id] = event
-                logger.info("Stored event \(event.id) from \(event.pubkey)")
-                
-                // Broadcast to subscribers
-                await broadcastToSubscribers(event: event)
             } else {
                 logger.debug("Ephemeral event \(event.id) - broadcasting without storage")
                 // Broadcast ephemeral events without storing
-                await broadcastToSubscribers(event: event)
+                await Self.broadcastEvent(event)
+                await sendOK(eventId: event.id, success: true, message: nil)
             }
-            
-            await sendOK(eventId: event.id, success: true, message: nil)
             
         case .invalid(let reason):
             logger.warning("Invalid event: \(reason)")
@@ -202,7 +233,7 @@ actor WebSocketHandler {
         subscriptions[subscriptionId] = filters
         logger.debug("Added subscription \(subscriptionId) with \(filters.count) filters")
         
-        // Send matching historical events
+        // Send matching historical events from database
         await sendHistoricalEvents(subscriptionId: subscriptionId, filters: filters)
         
         // Send EOSE
@@ -226,25 +257,17 @@ actor WebSocketHandler {
     }
     
     private func sendHistoricalEvents(subscriptionId: String, filters: [Filter]) async {
-        // Query in-memory store (temporary implementation)
-        let events = Self.eventStore.values
-        
+        // Query database for each filter
         for filter in filters {
-            var matchingEvents = events.filter { event in
-                filter.matches(event)
-            }
-            
-            // Sort by created_at descending
-            matchingEvents.sort { $0.createdAt > $1.createdAt }
-            
-            // Apply limit
-            if let limit = filter.limit {
-                matchingEvents = Array(matchingEvents.prefix(limit))
-            }
-            
-            // Send events
-            for event in matchingEvents {
-                await sendEvent(subscriptionId: subscriptionId, event: event)
+            do {
+                let events = try await eventRepository.getEvents(filter: filter)
+                
+                // Send events in chronological order (oldest first)
+                for event in events.reversed() {
+                    await sendEvent(subscriptionId: subscriptionId, event: event)
+                }
+            } catch {
+                logger.error("Failed to query events for subscription \(subscriptionId): \(error)")
             }
         }
     }
