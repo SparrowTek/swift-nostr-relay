@@ -9,8 +9,8 @@ let package = Package(
     ],
     products: [
         .executable(
-            name: "NostrRelayServer",
-            targets: ["NostrRelayServer"]
+            name: "swift-nostr-relay",
+            targets: ["swift-nostr-relay"]
         ),
     ],
     dependencies: [
@@ -25,7 +25,7 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "NostrRelayServer",
+            name: "swift-nostr-relay",
             dependencies: [
                 "CoreNostr",
                 .product(name: "Hummingbird", package: "hummingbird"),
@@ -39,9 +39,9 @@ let package = Package(
             ]
         ),
         .testTarget(
-            name: "NostrRelayServerTests",
+            name: "swift-nostr-relayTests",
             dependencies: [
-                "NostrRelayServer",
+                "swift-nostr-relay",
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
             ]
         ),
