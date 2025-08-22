@@ -15,6 +15,12 @@ actor EventRepository {
     // MARK: - Storage
     
     func storeEvent(_ event: NostrEvent) async throws -> Bool {
+        // Don't persist ephemeral events
+        if event.isEphemeral {
+            logger.debug("Skipping ephemeral event storage", metadata: ["event_id": "\(event.id)", "kind": "\(event.kind)"])
+            return false
+        }
+        
         let connection = try await databaseManager.getConnection()
         defer {
             Task {
@@ -38,8 +44,8 @@ actor EventRepository {
             return false
         }
         
-        // Handle replaceable events
-        if EventValidator.isReplaceable(kind: event.kind) {
+        // Handle replaceable and parameterized replaceable events
+        if event.isReplaceable || event.isParameterizedReplaceable {
             try await handleReplaceableEvent(event, connection: connection)
         }
         
@@ -77,7 +83,7 @@ actor EventRepository {
             }
             
             // Handle deletion events
-            if event.kind == 5 {
+            if event.isDeletion {
                 try await handleDeletionEvent(event, connection: connection)
             }
             
@@ -92,41 +98,52 @@ actor EventRepository {
     }
     
     private func handleReplaceableEvent(_ event: NostrEvent, connection: PostgresConnection) async throws {
-        if event.kind >= 10000 && event.kind < 20000 {
-            // Regular replaceable event
+        if event.isReplaceable {
+            // Regular replaceable event - delete all older events with same (pubkey, kind)
             let deleteQuery = PostgresQuery(
                 unsafeSQL: """
                     UPDATE events SET deleted = true
-                    WHERE pubkey = '\(event.pubkey)' AND kind = \(event.kind) AND deleted = false
+                    WHERE pubkey = '\(event.pubkey)' AND kind = \(event.kind) 
+                    AND created_at < \(event.createdAt) AND deleted = false
                     """
             )
             
             _ = try await connection.query(deleteQuery, logger: logger)
-        } else if event.kind >= 30000 && event.kind < 40000 {
-            // Parameterized replaceable event
-            let dTag = event.tags.first { $0.count >= 2 && $0[0] == "d" }?.dropFirst().first ?? ""
+            logger.debug("Replaced older events", metadata: [
+                "pubkey": "\(event.pubkey)",
+                "kind": "\(event.kind)"
+            ])
+            
+        } else if event.isParameterizedReplaceable {
+            // Parameterized replaceable event - delete older events with same (pubkey, kind, d-tag)
+            let dTag = event.dTag ?? ""
+            let escapedDTag = dTag.replacingOccurrences(of: "'", with: "''")
             
             let deleteQuery = PostgresQuery(
                 unsafeSQL: """
                     UPDATE events SET deleted = true
-                    WHERE pubkey = '\(event.pubkey)' AND kind = \(event.kind) AND deleted = false
+                    WHERE pubkey = '\(event.pubkey)' AND kind = \(event.kind) 
+                    AND created_at < \(event.createdAt) AND deleted = false
                     AND id IN (
                         SELECT e.id FROM events e
                         JOIN tags t ON e.id = t.event_id
-                        WHERE t.tag_name = 'd' AND t.tag_value = '\(dTag.replacingOccurrences(of: "'", with: "''"))'
+                        WHERE t.tag_name = 'd' AND t.tag_value = '\(escapedDTag)'
                     )
                     """
             )
             
             _ = try await connection.query(deleteQuery, logger: logger)
+            logger.debug("Replaced older parameterized events", metadata: [
+                "pubkey": "\(event.pubkey)",
+                "kind": "\(event.kind)",
+                "d_tag": "\(dTag)"
+            ])
         }
     }
     
     private func handleDeletionEvent(_ event: NostrEvent, connection: PostgresConnection) async throws {
         // Extract event IDs to delete from 'e' tags
-        let eventIdsToDelete = event.tags
-            .filter { $0.count >= 2 && $0[0] == "e" }
-            .map { $0[1] }
+        let eventIdsToDelete = EventTypes.getDeletedEventIds(from: event)
         
         for eventId in eventIdsToDelete {
             // Mark events as deleted (only if they're from the same author)

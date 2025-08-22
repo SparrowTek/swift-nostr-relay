@@ -87,8 +87,7 @@ struct EventValidator: Sendable {
         }
         
         // Check for ephemeral events (kinds 20000-29999)
-        let kindRange = Validation.eventKindRange(event.kind)
-        if kindRange == .ephemeral {
+        if event.isEphemeral {
             logger.debug("Ephemeral event \(event.id) - will not be stored")
         }
         
@@ -121,10 +120,8 @@ struct EventValidator: Sendable {
             
         case 5: // Event Deletion (NIP-09)
             // Must have 'e' tags for events to delete
-            let hasEventTags = event.tags.contains { tag in
-                tag.first == "e" && tag.count >= 2
-            }
-            if !hasEventTags {
+            let deletedEventIds = EventTypes.getDeletedEventIds(from: event)
+            if deletedEventIds.isEmpty {
                 return .invalid(reason: "invalid: deletion event must reference events with 'e' tags")
             }
             
@@ -157,31 +154,26 @@ struct EventValidator: Sendable {
     
     /// Checks if an event is ephemeral (should not be stored)
     static func isEphemeral(kind: Int) -> Bool {
-        return Validation.eventKindRange(kind) == .ephemeral
+        return EventTypes.isEphemeral(kind: kind)
     }
     
     /// Checks if an event is replaceable
     static func isReplaceable(kind: Int) -> Bool {
-        let range = Validation.eventKindRange(kind)
-        return range == .replaceable || range == .parameterizedReplaceable
+        return EventTypes.isReplaceable(kind: kind)
+    }
+    
+    /// Checks if an event is parameterized replaceable
+    static func isParameterizedReplaceable(kind: Int) -> Bool {
+        return EventTypes.isParameterizedReplaceable(kind: kind)
     }
     
     /// Gets the replacement key for a replaceable event
     static func getReplacementKey(event: NostrEvent) -> String? {
-        let range = Validation.eventKindRange(event.kind)
-        
-        switch range {
-        case .replaceable:
-            // Replace by (pubkey, kind)
-            return "\(event.pubkey):\(event.kind)"
-            
-        case .parameterizedReplaceable:
-            // Replace by (pubkey, kind, d-tag)
-            let dTag = event.tags.first { $0.first == "d" }?.dropFirst().first ?? ""
-            return "\(event.pubkey):\(event.kind):\(dTag)"
-            
-        default:
-            return nil
+        if let key = EventTypes.getReplaceableKey(event: event) {
+            return "\(key.pubkey):\(key.kind)"
+        } else if let key = EventTypes.getParameterizedReplaceableKey(event: event) {
+            return "\(key.pubkey):\(key.kind):\(key.dTag)"
         }
+        return nil
     }
 }

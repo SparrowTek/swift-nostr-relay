@@ -80,7 +80,7 @@ public struct ProofOfWork {
         maxIterations: Int = 1_000_000
     ) -> NostrEvent? {
         // Remove existing nonce tag if present
-        var tags = event.tags.filter { $0.count < 1 || $0[0] != "nonce" }
+        let tags = event.tags.filter { $0.count < 1 || $0[0] != "nonce" }
         
         for nonce in 0..<maxIterations {
             // Add nonce tag

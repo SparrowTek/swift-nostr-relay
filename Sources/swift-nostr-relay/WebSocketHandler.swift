@@ -246,15 +246,25 @@ actor WebSocketHandler {
     }
     
     private func processValidEvent(_ event: NostrEvent) async {
-        // Don't store ephemeral events
-        if !EventValidator.isEphemeral(kind: event.kind) {
+        // Handle different event types according to NIPs
+        let eventCategory = EventTypes.getCategory(kind: event.kind)
+        
+        logger.debug("Processing event", metadata: [
+            "eventId": "\(event.id)",
+            "kind": "\(event.kind)",
+            "category": "\(eventCategory.rawValue)"
+        ])
+        
+        // Don't store ephemeral events (NIP-16)
+        if !event.isEphemeral {
             do {
                 let stored = try await eventRepository.storeEvent(event)
                 
                 if stored {
                     logger.info("Stored event", metadata: [
                         "eventId": "\(event.id)",
-                        "pubkey": "\(event.pubkey)"
+                        "pubkey": "\(event.pubkey)",
+                        "category": "\(eventCategory.rawValue)"
                     ])
                     
                     // Broadcast to all connected clients
@@ -274,11 +284,16 @@ actor WebSocketHandler {
                 await sendOK(eventId: event.id, success: false, message: "error: failed to store event")
             }
         } else {
+            // Ephemeral event (NIP-16) - broadcast without storing
             logger.debug("Ephemeral event - broadcasting without storage", metadata: [
-                "eventId": "\(event.id)"
+                "eventId": "\(event.id)",
+                "kind": "\(event.kind)"
             ])
-            // Broadcast ephemeral events without storing
+            
+            // Broadcast to all connected clients with matching subscriptions
             await Self.broadcastEvent(event)
+            
+            // Send OK response for ephemeral events
             await sendOK(eventId: event.id, success: true, message: nil)
         }
     }
