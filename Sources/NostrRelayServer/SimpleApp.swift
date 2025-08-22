@@ -47,58 +47,13 @@ func buildApplication(logger: Logger) async throws -> some ApplicationProtocol {
     
     // WebSocket endpoint
     wsRouter.ws("/ws") { inbound, outbound, _ in
-        logger.info("New WebSocket connection")
-        
-        // Simple echo for now
-        for try await frame in inbound {
-            switch frame.opcode {
-            case .text:
-                let text = String(buffer: frame.data)
-                logger.info("Received: \(text)")
-                
-                // Parse and respond
-                if let data = text.data(using: .utf8),
-                   let json = try? JSONSerialization.jsonObject(with: data) as? [Any],
-                   let messageType = json.first as? String {
-                    
-                    switch messageType.uppercased() {
-                    case "EVENT":
-                        let response = ["OK", "placeholder-id", false, "Events not yet implemented"]
-                        if let responseData = try? JSONSerialization.data(withJSONObject: response),
-                           let responseText = String(data: responseData, encoding: .utf8) {
-                            try await outbound.write(.text(responseText))
-                        }
-                        
-                    case "REQ":
-                        if json.count > 1, let subId = json[1] as? String {
-                            let eose = ["EOSE", subId]
-                            if let eoseData = try? JSONSerialization.data(withJSONObject: eose),
-                               let eoseText = String(data: eoseData, encoding: .utf8) {
-                                try await outbound.write(.text(eoseText))
-                            }
-                        }
-                        
-                    default:
-                        let notice = ["NOTICE", "Unknown command: \(messageType)"]
-                        if let noticeData = try? JSONSerialization.data(withJSONObject: notice),
-                           let noticeText = String(data: noticeData, encoding: .utf8) {
-                            try await outbound.write(.text(noticeText))
-                        }
-                    }
-                }
-                
-            case .binary:
-                let notice = ["NOTICE", "Binary messages not supported"]
-                if let noticeData = try? JSONSerialization.data(withJSONObject: notice),
-                   let noticeText = String(data: noticeData, encoding: .utf8) {
-                    try await outbound.write(.text(noticeText))
-                }
-            default:
-                break
-            }
-        }
-        
-        logger.info("WebSocket connection closed")
+        let handler = WebSocketHandler(
+            inbound: inbound,
+            outbound: outbound,
+            configuration: configuration,
+            logger: logger
+        )
+        try await handler.handle()
     }
     
     let app = Application(

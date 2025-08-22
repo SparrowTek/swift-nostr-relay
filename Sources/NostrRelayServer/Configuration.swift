@@ -1,6 +1,6 @@
 import Foundation
 
-struct RelayConfiguration {
+struct RelayConfiguration: Sendable {
     let host: String
     let port: Int
     let databaseURL: String
@@ -19,6 +19,9 @@ struct RelayConfiguration {
     let supportedNips: [Int]
     let software: String
     let version: String
+    
+    // Relay limitations
+    let limitation: RelayLimitation
     
     init() {
         // Server config
@@ -53,5 +56,38 @@ struct RelayConfiguration {
         
         self.software = "https://github.com/SparrowTek/swift-nostr-relay"
         self.version = "0.1.0"
+        
+        // Relay limitations
+        self.limitation = RelayLimitation(
+            maxMessageLength: maxEventBytes,
+            maxSubscriptions: Int(ProcessInfo.processInfo.environment["MAX_SUBSCRIPTIONS"] ?? "100") ?? 100,
+            maxFilters: Int(ProcessInfo.processInfo.environment["MAX_FILTERS"] ?? "10") ?? 10,
+            maxLimit: Int(ProcessInfo.processInfo.environment["MAX_LIMIT"] ?? "5000") ?? 5000,
+            maxSubidLength: Int(ProcessInfo.processInfo.environment["MAX_SUBID_LENGTH"] ?? "256") ?? 256,
+            maxEventTags: Int(ProcessInfo.processInfo.environment["MAX_EVENT_TAGS"] ?? "100") ?? 100,
+            maxContentLength: maxEventBytes,
+            minPowDifficulty: nil,
+            authRequired: authRequired,
+            paymentRequired: false,
+            restrictedWrites: false,
+            createdAtLowerLimit: nil,
+            createdAtUpperLimit: nil
+        )
     }
+}
+
+struct RelayLimitation: Sendable {
+    let maxMessageLength: Int?
+    let maxSubscriptions: Int?
+    let maxFilters: Int?
+    let maxLimit: Int?
+    let maxSubidLength: Int?
+    let maxEventTags: Int?
+    let maxContentLength: Int?
+    let minPowDifficulty: Int?
+    let authRequired: Bool?
+    let paymentRequired: Bool?
+    let restrictedWrites: Bool?
+    let createdAtLowerLimit: Int?
+    let createdAtUpperLimit: Int?
 }

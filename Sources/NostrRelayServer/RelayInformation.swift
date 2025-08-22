@@ -76,19 +76,19 @@ struct RelayInformation: Codable {
         self.version = configuration.version
         
         self.limitation = Limitation(
-            maxMessageLength: configuration.maxEventBytes,
-            maxSubscriptions: 100,
-            maxFilters: 10,
-            maxLimit: 5000,
-            maxSubidLength: 256,
-            maxEventTags: 100,
-            maxContentLength: configuration.maxEventBytes,
-            minPowDifficulty: nil,
-            authRequired: configuration.authRequired,
-            paymentRequired: false,
-            restrictedWrites: false,
-            createdAtLowerLimit: nil,
-            createdAtUpperLimit: nil
+            maxMessageLength: configuration.limitation.maxMessageLength,
+            maxSubscriptions: configuration.limitation.maxSubscriptions,
+            maxFilters: configuration.limitation.maxFilters,
+            maxLimit: configuration.limitation.maxLimit,
+            maxSubidLength: configuration.limitation.maxSubidLength,
+            maxEventTags: configuration.limitation.maxEventTags,
+            maxContentLength: configuration.limitation.maxContentLength,
+            minPowDifficulty: configuration.limitation.minPowDifficulty,
+            authRequired: configuration.limitation.authRequired,
+            paymentRequired: configuration.limitation.paymentRequired,
+            restrictedWrites: configuration.limitation.restrictedWrites,
+            createdAtLowerLimit: configuration.limitation.createdAtLowerLimit,
+            createdAtUpperLimit: configuration.limitation.createdAtUpperLimit
         )
         
         self.retention = nil
