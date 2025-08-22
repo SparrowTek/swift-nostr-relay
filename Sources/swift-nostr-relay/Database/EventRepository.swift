@@ -23,7 +23,7 @@ actor EventRepository {
         }
         
         // Check if event already exists
-        let checkQuery = PostgresQuery(unsafeSQL: "SELECT id FROM events WHERE id = $1", binds: [event.id])
+        let checkQuery = PostgresQuery(unsafeSQL: "SELECT id FROM events WHERE id = '\(event.id)'")
         let existingRows = try await connection.query(checkQuery, logger: logger)
         
         // Collect rows
@@ -48,19 +48,13 @@ actor EventRepository {
         
         do {
             // Insert the event
+            // Escape single quotes in content for SQL
+            let escapedContent = event.content.replacingOccurrences(of: "'", with: "''")
             let insertEventQuery = PostgresQuery(
                 unsafeSQL: """
                     INSERT INTO events (id, pubkey, created_at, kind, content, sig)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    """,
-                binds: [
-                    event.id,
-                    event.pubkey,
-                    event.createdAt,
-                    Int32(event.kind),
-                    event.content,
-                    event.sig
-                ]
+                    VALUES ('\(event.id)', '\(event.pubkey)', \(event.createdAt), \(event.kind), '\(escapedContent)', '\(event.sig)')
+                    """
             )
             
             _ = try await connection.query(insertEventQuery, logger: logger)
@@ -69,17 +63,14 @@ actor EventRepository {
             for (index, tag) in event.tags.enumerated() {
                 guard tag.count >= 2 else { continue }
                 
+                // Escape single quotes for SQL
+                let escapedTagName = tag[0].replacingOccurrences(of: "'", with: "''")
+                let escapedTagValue = tag[1].replacingOccurrences(of: "'", with: "''")
                 let insertTagQuery = PostgresQuery(
                     unsafeSQL: """
                         INSERT INTO tags (event_id, tag_name, tag_value, tag_index)
-                        VALUES ($1, $2, $3, $4)
-                        """,
-                    binds: [
-                        event.id,
-                        tag[0],
-                        tag[1],
-                        Int32(index)
-                    ]
+                        VALUES ('\(event.id)', '\(escapedTagName)', '\(escapedTagValue)', \(index))
+                        """
                 )
                 
                 _ = try await connection.query(insertTagQuery, logger: logger)
@@ -106,9 +97,8 @@ actor EventRepository {
             let deleteQuery = PostgresQuery(
                 unsafeSQL: """
                     UPDATE events SET deleted = true
-                    WHERE pubkey = $1 AND kind = $2 AND deleted = false
-                    """,
-                binds: [event.pubkey, Int32(event.kind)]
+                    WHERE pubkey = '\(event.pubkey)' AND kind = \(event.kind) AND deleted = false
+                    """
             )
             
             _ = try await connection.query(deleteQuery, logger: logger)
@@ -119,14 +109,13 @@ actor EventRepository {
             let deleteQuery = PostgresQuery(
                 unsafeSQL: """
                     UPDATE events SET deleted = true
-                    WHERE pubkey = $1 AND kind = $2 AND deleted = false
+                    WHERE pubkey = '\(event.pubkey)' AND kind = \(event.kind) AND deleted = false
                     AND id IN (
                         SELECT e.id FROM events e
                         JOIN tags t ON e.id = t.event_id
-                        WHERE t.tag_name = 'd' AND t.tag_value = $3
+                        WHERE t.tag_name = 'd' AND t.tag_value = '\(dTag.replacingOccurrences(of: "'", with: "''"))'
                     )
-                    """,
-                binds: [event.pubkey, Int32(event.kind), dTag]
+                    """
             )
             
             _ = try await connection.query(deleteQuery, logger: logger)
@@ -144,9 +133,8 @@ actor EventRepository {
             let updateQuery = PostgresQuery(
                 unsafeSQL: """
                     UPDATE events SET deleted = true
-                    WHERE id = $1 AND pubkey = $2
-                    """,
-                binds: [eventId, event.pubkey]
+                    WHERE id = '\(eventId)' AND pubkey = '\(event.pubkey)'
+                    """
             )
             
             _ = try await connection.query(updateQuery, logger: logger)
@@ -155,9 +143,8 @@ actor EventRepository {
             let insertDeletionQuery = PostgresQuery(
                 unsafeSQL: """
                     INSERT INTO deletions (deleted_event_id, deletion_event_id)
-                    VALUES ($1, $2)
-                    """,
-                binds: [eventId, event.id]
+                    VALUES ('\(eventId)', '\(event.id)')
+                    """
             )
             
             _ = try await connection.query(insertDeletionQuery, logger: logger)
@@ -186,10 +173,9 @@ actor EventRepository {
             let tagsQuery = PostgresQuery(
                 unsafeSQL: """
                     SELECT tag_name, tag_value FROM tags
-                    WHERE event_id = $1
+                    WHERE event_id = '\(id)'
                     ORDER BY tag_index
-                    """,
-                binds: [id]
+                    """
             )
             
             let tagRows = try await connection.query(tagsQuery, logger: logger)
@@ -202,7 +188,7 @@ actor EventRepository {
             let event = try NostrEvent(
                 id: id,
                 pubkey: pubkey,
-                createdAt: createdAt,
+                createdAt: Int64(createdAt),
                 kind: Int(kind),
                 tags: tags,
                 content: content,
@@ -236,54 +222,45 @@ private struct QueryBuilder {
     
     func buildQuery() -> PostgresQuery {
         var sql = "SELECT id, pubkey, created_at, kind, content, sig FROM events WHERE deleted = false"
-        var binds: [PostgresEncodable] = []
-        var bindIndex = 1
         
         // Event IDs
         if let ids = filter.ids, !ids.isEmpty {
-            let placeholders = ids.map { _ in "$\(bindIndex + binds.count)" }.joined(separator: ", ")
-            sql += " AND id IN (\(placeholders))"
-            binds.append(contentsOf: ids)
+            let escapedIds = ids.map { "'\($0)'" }.joined(separator: ", ")
+            sql += " AND id IN (\(escapedIds))"
         }
         
         // Authors
         if let authors = filter.authors, !authors.isEmpty {
-            let placeholders = authors.map { _ in "$\(bindIndex + binds.count)" }.joined(separator: ", ")
-            sql += " AND pubkey IN (\(placeholders))"
-            binds.append(contentsOf: authors)
+            let escapedAuthors = authors.map { "'\($0)'" }.joined(separator: ", ")
+            sql += " AND pubkey IN (\(escapedAuthors))"
         }
         
         // Kinds
         if let kinds = filter.kinds, !kinds.isEmpty {
-            let placeholders = kinds.map { _ in "$\(bindIndex + binds.count)" }.joined(separator: ", ")
-            sql += " AND kind IN (\(placeholders))"
-            binds.append(contentsOf: kinds.map { Int32($0) })
+            let kindsStr = kinds.map { String($0) }.joined(separator: ", ")
+            sql += " AND kind IN (\(kindsStr))"
         }
         
         // Since (filter.since is Int64 timestamp)
         if let since = filter.since {
-            sql += " AND created_at >= $\(bindIndex + binds.count)"
-            binds.append(since)
+            sql += " AND created_at >= \(since)"
         }
         
         // Until (filter.until is Int64 timestamp)
         if let until = filter.until {
-            sql += " AND created_at <= $\(bindIndex + binds.count)"
-            binds.append(until)
+            sql += " AND created_at <= \(until)"
         }
         
         // #e tags
         if let eTags = filter.e, !eTags.isEmpty {
-            let placeholders = eTags.map { _ in "$\(bindIndex + binds.count)" }.joined(separator: ", ")
-            sql += " AND EXISTS (SELECT 1 FROM tags WHERE tags.event_id = events.id AND tag_name = 'e' AND tag_value IN (\(placeholders)))"
-            binds.append(contentsOf: eTags)
+            let escapedETags = eTags.map { "'\($0.replacingOccurrences(of: "'", with: "''"))'" }.joined(separator: ", ")
+            sql += " AND EXISTS (SELECT 1 FROM tags WHERE tags.event_id = events.id AND tag_name = 'e' AND tag_value IN (\(escapedETags)))"
         }
         
         // #p tags
         if let pTags = filter.p, !pTags.isEmpty {
-            let placeholders = pTags.map { _ in "$\(bindIndex + binds.count)" }.joined(separator: ", ")
-            sql += " AND EXISTS (SELECT 1 FROM tags WHERE tags.event_id = events.id AND tag_name = 'p' AND tag_value IN (\(placeholders)))"
-            binds.append(contentsOf: pTags)
+            let escapedPTags = pTags.map { "'\($0.replacingOccurrences(of: "'", with: "''"))'" }.joined(separator: ", ")
+            sql += " AND EXISTS (SELECT 1 FROM tags WHERE tags.event_id = events.id AND tag_name = 'p' AND tag_value IN (\(escapedPTags)))"
         }
         
         // Order by created_at descending
@@ -292,10 +269,9 @@ private struct QueryBuilder {
         // Limit
         let effectiveLimit = limit ?? filter.limit
         if let effectiveLimit = effectiveLimit {
-            sql += " LIMIT $\(bindIndex + binds.count)"
-            binds.append(Int32(effectiveLimit))
+            sql += " LIMIT \(effectiveLimit)"
         }
         
-        return PostgresQuery(unsafeSQL: sql, binds: binds)
+        return PostgresQuery(unsafeSQL: sql)
     }
 }

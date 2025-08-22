@@ -4,7 +4,7 @@ import CoreNostr
 import Logging
 import NIOCore
 
-/// Handles WebSocket connections for Nostr relay protocol with database support
+/// Handles WebSocket connections for Nostr relay protocol with database support and rate limiting
 actor WebSocketHandler {
     let inbound: WebSocketInboundStream
     let outbound: WebSocketOutboundWriter
@@ -12,6 +12,9 @@ actor WebSocketHandler {
     let logger: Logger
     let connectionId = UUID()
     let eventRepository: EventRepository
+    let rateLimiter: RateLimiter
+    let spamFilter: SpamFilter
+    let clientIP: String
     
     private let validator: EventValidator
     private var subscriptions: [String: [Filter]] = [:]
@@ -24,24 +27,37 @@ actor WebSocketHandler {
         outbound: WebSocketOutboundWriter,
         configuration: RelayConfiguration,
         eventRepository: EventRepository,
+        rateLimiter: RateLimiter,
+        spamFilter: SpamFilter,
+        clientIP: String,
         logger: Logger
     ) {
         self.inbound = inbound
         self.outbound = outbound
         self.configuration = configuration
         self.eventRepository = eventRepository
+        self.rateLimiter = rateLimiter
+        self.spamFilter = spamFilter
+        self.clientIP = clientIP
         self.logger = logger
         self.validator = EventValidator(configuration: configuration, logger: logger)
     }
     
     func handle() async throws {
-        logger.info("New WebSocket connection: \(connectionId)")
+        logger.info("New WebSocket connection", metadata: [
+            "connectionId": "\(connectionId)",
+            "ip": "\(clientIP)"
+        ])
+        
+        // Register connection with rate limiter
+        await rateLimiter.registerConnection(from: clientIP)
         
         // Add to active handlers
         await Self.addHandler(self)
         
         defer {
             Task {
+                await rateLimiter.unregisterConnection(from: clientIP)
                 await Self.removeHandler(self)
             }
         }
@@ -61,10 +77,16 @@ actor WebSocketHandler {
                 }
             }
         } catch {
-            logger.error("WebSocket error for \(connectionId): \(error)")
+            logger.error("WebSocket error", metadata: [
+                "connectionId": "\(connectionId)",
+                "error": "\(error)"
+            ])
         }
         
-        logger.info("WebSocket connection closed: \(connectionId)")
+        logger.info("WebSocket connection closed", metadata: [
+            "connectionId": "\(connectionId)",
+            "ip": "\(clientIP)"
+        ])
     }
     
     private static func addHandler(_ handler: WebSocketHandler) async {
@@ -112,7 +134,9 @@ actor WebSocketHandler {
                 await sendNotice("Unknown message type: \(messageType)")
             }
         } catch {
-            logger.error("Failed to parse message: \(error)")
+            logger.error("Failed to parse message", metadata: [
+                "error": "\(error)"
+            ])
             await sendNotice("Invalid JSON: \(error.localizedDescription)")
         }
     }
@@ -125,52 +149,137 @@ actor WebSocketHandler {
         
         let eventJSON = array[1]
         
-        // Validate the event
+        // First validate the event structure
         let result = validator.validate(eventJSON: eventJSON)
         
         switch result {
         case .valid(let event):
-            // Don't store ephemeral events
-            if !EventValidator.isEphemeral(kind: event.kind) {
-                do {
-                    let stored = try await eventRepository.storeEvent(event)
-                    
-                    if stored {
-                        logger.info("Stored event \(event.id) from \(event.pubkey)")
-                        
-                        // Broadcast to all connected clients
-                        await Self.broadcastEvent(event)
-                        await sendOK(eventId: event.id, success: true, message: nil)
-                    } else {
-                        // Event already exists
-                        logger.debug("Duplicate event: \(event.id)")
-                        await sendOK(eventId: event.id, success: false, message: "duplicate: event already exists")
+            // Check rate limits
+            let eventSize = event.content.utf8.count + event.tags.reduce(0) { $0 + $1.joined().utf8.count }
+            let rateLimitResult = await rateLimiter.checkEventLimit(
+                ip: clientIP,
+                pubkey: event.pubkey,
+                eventSize: eventSize
+            )
+            
+            switch rateLimitResult {
+            case .allowed:
+                // Check proof of work if required
+                if configuration.rateLimitConfig.requireProofOfWork {
+                    if !ProofOfWork.verifyEvent(event, minDifficulty: configuration.rateLimitConfig.minPowDifficulty) {
+                        logger.warning("Insufficient proof of work", metadata: [
+                            "pubkey": "\(event.pubkey)",
+                            "eventId": "\(event.id)",
+                            "difficulty": "\(ProofOfWork.calculateDifficulty(eventId: event.id))",
+                            "required": "\(configuration.rateLimitConfig.minPowDifficulty)"
+                        ])
+                        await sendOK(eventId: event.id, success: false, message: "pow: insufficient proof of work")
+                        return
                     }
-                } catch {
-                    logger.error("Failed to store event: \(error)")
-                    await sendOK(eventId: event.id, success: false, message: "error: failed to store event")
                 }
-            } else {
-                logger.debug("Ephemeral event \(event.id) - broadcasting without storage")
-                // Broadcast ephemeral events without storing
-                await Self.broadcastEvent(event)
-                await sendOK(eventId: event.id, success: true, message: nil)
+                
+                // Check spam filter
+                let spamResult = await spamFilter.checkEvent(event)
+                
+                switch spamResult {
+                case .pass:
+                    // Event passed all checks, store it
+                    await processValidEvent(event)
+                    
+                case .reject(let reason):
+                    logger.warning("Event rejected by spam filter", metadata: [
+                        "pubkey": "\(event.pubkey)",
+                        "eventId": "\(event.id)",
+                        "reason": "\(reason)"
+                    ])
+                    await rateLimiter.metrics.recordEvent(ip: clientIP, pubkey: event.pubkey, accepted: false, reason: "spam: \(reason)")
+                    await sendOK(eventId: event.id, success: false, message: "spam: \(reason)")
+                    
+                case .suspicious(let reason):
+                    logger.info("Suspicious event allowed", metadata: [
+                        "pubkey": "\(event.pubkey)",
+                        "eventId": "\(event.id)",
+                        "reason": "\(reason)"
+                    ])
+                    // Allow suspicious events but log them
+                    await processValidEvent(event)
+                }
+                
+            case .limited(let reason):
+                logger.warning("Rate limit exceeded", metadata: [
+                    "ip": "\(clientIP)",
+                    "pubkey": "\(event.pubkey)",
+                    "reason": "\(reason)"
+                ])
+                await sendNotice("rate-limited: \(reason)")
+                
+            case .blocked(let reason):
+                logger.warning("Blocked event", metadata: [
+                    "ip": "\(clientIP)",
+                    "pubkey": "\(event.pubkey)",
+                    "reason": "\(reason)"
+                ])
+                await sendOK(eventId: event.id, success: false, message: "blocked: \(reason)")
             }
             
         case .invalid(let reason):
-            logger.warning("Invalid event: \(reason)")
+            logger.warning("Invalid event", metadata: [
+                "reason": "\(reason)"
+            ])
             await sendOK(eventId: extractEventId(from: eventJSON) ?? "unknown", success: false, message: reason)
             
         case .duplicate(let eventId):
-            logger.debug("Duplicate event: \(eventId)")
+            logger.debug("Duplicate event", metadata: [
+                "eventId": "\(eventId)"
+            ])
             await sendOK(eventId: eventId, success: false, message: "duplicate: event already exists")
             
         case .rateLimited:
             await sendNotice("rate-limited: too many events, please slow down")
             
         case .blocked(let reason):
-            logger.warning("Blocked event: \(reason)")
+            logger.warning("Blocked event", metadata: [
+                "reason": "\(reason)"
+            ])
             await sendOK(eventId: extractEventId(from: eventJSON) ?? "unknown", success: false, message: "blocked: \(reason)")
+        }
+    }
+    
+    private func processValidEvent(_ event: NostrEvent) async {
+        // Don't store ephemeral events
+        if !EventValidator.isEphemeral(kind: event.kind) {
+            do {
+                let stored = try await eventRepository.storeEvent(event)
+                
+                if stored {
+                    logger.info("Stored event", metadata: [
+                        "eventId": "\(event.id)",
+                        "pubkey": "\(event.pubkey)"
+                    ])
+                    
+                    // Broadcast to all connected clients
+                    await Self.broadcastEvent(event)
+                    await sendOK(eventId: event.id, success: true, message: nil)
+                } else {
+                    // Event already exists
+                    logger.debug("Duplicate event", metadata: [
+                        "eventId": "\(event.id)"
+                    ])
+                    await sendOK(eventId: event.id, success: false, message: "duplicate: event already exists")
+                }
+            } catch {
+                logger.error("Failed to store event", metadata: [
+                    "error": "\(error)"
+                ])
+                await sendOK(eventId: event.id, success: false, message: "error: failed to store event")
+            }
+        } else {
+            logger.debug("Ephemeral event - broadcasting without storage", metadata: [
+                "eventId": "\(event.id)"
+            ])
+            // Broadcast ephemeral events without storing
+            await Self.broadcastEvent(event)
+            await sendOK(eventId: event.id, success: true, message: nil)
         }
     }
     
@@ -182,6 +291,13 @@ actor WebSocketHandler {
         
         guard let subscriptionId = array[1] as? String else {
             await sendNotice("REQ subscription ID must be a string")
+            return
+        }
+        
+        // Check subscription rate limit
+        let canSubscribe = await rateLimiter.checkSubscriptionLimit(ip: clientIP)
+        if !canSubscribe {
+            await sendNotice("rate-limited: too many subscriptions")
             return
         }
         
@@ -231,7 +347,10 @@ actor WebSocketHandler {
         
         // Store subscription
         subscriptions[subscriptionId] = filters
-        logger.debug("Added subscription \(subscriptionId) with \(filters.count) filters")
+        logger.debug("Added subscription", metadata: [
+            "subscriptionId": "\(subscriptionId)",
+            "filters": "\(filters.count)"
+        ])
         
         // Send matching historical events from database
         await sendHistoricalEvents(subscriptionId: subscriptionId, filters: filters)
@@ -248,7 +367,9 @@ actor WebSocketHandler {
         }
         
         subscriptions.removeValue(forKey: subscriptionId)
-        logger.debug("Closed subscription: \(subscriptionId)")
+        logger.debug("Closed subscription", metadata: [
+            "subscriptionId": "\(subscriptionId)"
+        ])
     }
     
     private func handleAuth(_ array: [Any]) async {
@@ -267,7 +388,10 @@ actor WebSocketHandler {
                     await sendEvent(subscriptionId: subscriptionId, event: event)
                 }
             } catch {
-                logger.error("Failed to query events for subscription \(subscriptionId): \(error)")
+                logger.error("Failed to query events", metadata: [
+                    "subscriptionId": "\(subscriptionId)",
+                    "error": "\(error)"
+                ])
             }
         }
     }
@@ -312,7 +436,9 @@ actor WebSocketHandler {
             let message = ["EVENT", subscriptionId, eventJSON] as [Any]
             await sendJSON(message)
         } catch {
-            logger.error("Failed to send event: \(error)")
+            logger.error("Failed to send event", metadata: [
+                "error": "\(error)"
+            ])
         }
     }
     
@@ -323,7 +449,9 @@ actor WebSocketHandler {
                 try await outbound.write(.text(text))
             }
         } catch {
-            logger.error("Failed to send message: \(error)")
+            logger.error("Failed to send message", metadata: [
+                "error": "\(error)"
+            ])
         }
     }
     
