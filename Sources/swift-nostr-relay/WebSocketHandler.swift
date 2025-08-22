@@ -5,7 +5,7 @@ import Logging
 import NIOCore
 
 /// Handles WebSocket connections for Nostr relay protocol with database support and rate limiting
-actor WebSocketHandler {
+final class WebSocketHandler: Sendable {
     let inbound: WebSocketInboundStream
     let outbound: WebSocketOutboundWriter
     let configuration: RelayConfiguration
@@ -14,13 +14,10 @@ actor WebSocketHandler {
     let eventRepository: EventRepository
     let rateLimiter: RateLimiter
     let spamFilter: SpamFilter
+    let subscriptionManager: SubscriptionManager
     let clientIP: String
     
     private let validator: EventValidator
-    private var subscriptions: [String: [Filter]] = [:]
-    
-    // Track active connections for live broadcasting
-    static var activeHandlers: [WebSocketHandler] = []
     
     init(
         inbound: WebSocketInboundStream,
@@ -29,6 +26,7 @@ actor WebSocketHandler {
         eventRepository: EventRepository,
         rateLimiter: RateLimiter,
         spamFilter: SpamFilter,
+        subscriptionManager: SubscriptionManager,
         clientIP: String,
         logger: Logger
     ) {
@@ -38,6 +36,7 @@ actor WebSocketHandler {
         self.eventRepository = eventRepository
         self.rateLimiter = rateLimiter
         self.spamFilter = spamFilter
+        self.subscriptionManager = subscriptionManager
         self.clientIP = clientIP
         self.logger = logger
         self.validator = EventValidator(configuration: configuration, logger: logger)
@@ -52,13 +51,13 @@ actor WebSocketHandler {
         // Register connection with rate limiter
         await rateLimiter.registerConnection(from: clientIP)
         
-        // Add to active handlers
-        await Self.addHandler(self)
+        // Register with subscription manager
+        await subscriptionManager.registerConnection(id: connectionId, clientIP: clientIP, handler: self)
         
         defer {
-            Task {
+            Task { [clientIP, connectionId, rateLimiter, subscriptionManager] in
                 await rateLimiter.unregisterConnection(from: clientIP)
-                await Self.removeHandler(self)
+                await subscriptionManager.unregisterConnection(id: connectionId)
             }
         }
         
@@ -87,20 +86,6 @@ actor WebSocketHandler {
             "connectionId": "\(connectionId)",
             "ip": "\(clientIP)"
         ])
-    }
-    
-    private static func addHandler(_ handler: WebSocketHandler) async {
-        activeHandlers.append(handler)
-    }
-    
-    private static func removeHandler(_ handler: WebSocketHandler) async {
-        activeHandlers.removeAll { $0.connectionId == handler.connectionId }
-    }
-    
-    static func broadcastEvent(_ event: NostrEvent) async {
-        for handler in activeHandlers {
-            await handler.broadcastToSubscribers(event: event)
-        }
     }
     
     private func handleTextMessage(_ text: String) async {
@@ -267,12 +252,12 @@ actor WebSocketHandler {
                         "category": "\(eventCategory.rawValue)"
                     ])
                     
-                    // Broadcast to all connected clients
-                    await Self.broadcastEvent(event)
+                    // Broadcast to all connected clients via subscription manager
+                    await subscriptionManager.broadcastEvent(event)
                     await sendOK(eventId: event.id, success: true, message: nil)
                 } else {
-                    // Event already exists
-                    logger.debug("Duplicate event", metadata: [
+                    // Event already exists or was replaced
+                    logger.debug("Event not stored", metadata: [
                         "eventId": "\(event.id)"
                     ])
                     await sendOK(eventId: event.id, success: false, message: "duplicate: event already exists")
@@ -291,7 +276,7 @@ actor WebSocketHandler {
             ])
             
             // Broadcast to all connected clients with matching subscriptions
-            await Self.broadcastEvent(event)
+            await subscriptionManager.broadcastEvent(event)
             
             // Send OK response for ephemeral events
             await sendOK(eventId: event.id, success: true, message: nil)
@@ -323,7 +308,8 @@ actor WebSocketHandler {
         }
         
         // Check max subscriptions per connection
-        if subscriptions.count >= (configuration.limitation.maxSubscriptions ?? 100) {
+        let currentSubCount = await subscriptionManager.getSubscriptionCount()
+        if currentSubCount >= (configuration.limitation.maxSubscriptions ?? 100) {
             await sendNotice("Too many subscriptions: maximum \(configuration.limitation.maxSubscriptions ?? 100) per connection")
             return
         }
@@ -360,18 +346,27 @@ actor WebSocketHandler {
             return
         }
         
-        // Store subscription
-        subscriptions[subscriptionId] = filters
-        logger.debug("Added subscription", metadata: [
-            "subscriptionId": "\(subscriptionId)",
-            "filters": "\(filters.count)"
-        ])
+        // Add subscription to manager
+        let added = await subscriptionManager.addSubscription(
+            connectionId: connectionId,
+            subscriptionId: subscriptionId,
+            filters: filters
+        )
         
-        // Send matching historical events from database
-        await sendHistoricalEvents(subscriptionId: subscriptionId, filters: filters)
-        
-        // Send EOSE
-        await sendEOSE(subscriptionId: subscriptionId)
+        if added {
+            logger.debug("Added subscription", metadata: [
+                "subscriptionId": "\(subscriptionId)",
+                "filters": "\(filters.count)"
+            ])
+            
+            // Send matching historical events from database
+            await sendHistoricalEvents(subscriptionId: subscriptionId, filters: filters)
+            
+            // Send EOSE
+            await sendEOSE(subscriptionId: subscriptionId)
+        } else {
+            await sendNotice("Failed to add subscription")
+        }
     }
     
     private func handleClose(_ array: [Any]) async {
@@ -381,7 +376,7 @@ actor WebSocketHandler {
             return
         }
         
-        subscriptions.removeValue(forKey: subscriptionId)
+        await subscriptionManager.removeSubscription(subscriptionId: subscriptionId)
         logger.debug("Closed subscription", metadata: [
             "subscriptionId": "\(subscriptionId)"
         ])
@@ -411,14 +406,6 @@ actor WebSocketHandler {
         }
     }
     
-    private func broadcastToSubscribers(event: NostrEvent) async {
-        for (subscriptionId, filters) in subscriptions {
-            if filters.contains(where: { $0.matches(event) }) {
-                await sendEvent(subscriptionId: subscriptionId, event: event)
-            }
-        }
-    }
-    
     // MARK: - Send Methods
     
     private func sendNotice(_ message: String) async {
@@ -439,7 +426,7 @@ actor WebSocketHandler {
         await sendJSON(eose)
     }
     
-    private func sendEvent(subscriptionId: String, event: NostrEvent) async {
+    nonisolated func sendEvent(subscriptionId: String, event: NostrEvent) async {
         do {
             let encoder = JSONEncoder()
             let eventData = try encoder.encode(event)
@@ -457,7 +444,7 @@ actor WebSocketHandler {
         }
     }
     
-    private func sendJSON(_ object: Any) async {
+    nonisolated func sendJSON(_ object: Any) async {
         do {
             let data = try JSONSerialization.data(withJSONObject: object)
             if let text = String(data: data, encoding: .utf8) {

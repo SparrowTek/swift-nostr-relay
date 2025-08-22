@@ -17,6 +17,9 @@ func buildApplication(logger: Logger) async throws -> some ApplicationProtocol {
     let rateLimiter = RateLimiter(configuration: configuration.rateLimitConfig, logger: logger)
     let spamFilter = SpamFilter(configuration: configuration.spamFilterConfig, logger: logger)
     
+    // Initialize subscription manager for live event delivery
+    let subscriptionManager = SubscriptionManager(logger: logger)
+    
     // Create WebSocket router
     let wsRouter = Router(context: BasicWebSocketRequestContext.self)
     
@@ -94,6 +97,7 @@ func buildApplication(logger: Logger) async throws -> some ApplicationProtocol {
             eventRepository: eventRepository,
             rateLimiter: rateLimiter,
             spamFilter: spamFilter,
+            subscriptionManager: subscriptionManager,
             clientIP: clientIP,
             logger: logger
         )
